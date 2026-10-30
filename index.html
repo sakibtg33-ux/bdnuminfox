@@ -259,38 +259,88 @@
 </div>
 <div class="foot"></div>
 
-<!-- /api/lookup shim — answers client-side from /data.json, three files total -->
+<!-- /api/lookup shim: answers in-page from /data.json.
+     Repair handles BOTH trailing commas AND missing commas between tokens.
+     Three files total: index.html, data.json, vercel.json. -->
 <script>
 (function () {
   let _cache = null;
 
-  async function _load() {
-    if (_cache) return _cache;
-    const r = await fetch('/data.json', { cache: 'force-cache' });
-    if (!r.ok) throw new Error('data.json HTTP ' + r.status);
-    let raw = await r.text();
-
-    // string-aware trailing-comma strip — never touches commas inside strings
-    let out = '', inStr = false, esc = false;
+  function repairJSON(raw) {
+    // pass 1 — strip trailing commas (string-aware)
+    let s1 = '', inStr = false, esc = false;
     for (let i = 0; i < raw.length; i++) {
       const c = raw[i];
       if (inStr) {
-        out += c;
+        s1 += c;
         if (esc) esc = false;
         else if (c === '\\') esc = true;
         else if (c === '"') inStr = false;
         continue;
       }
-      if (c === '"') { inStr = true; out += c; continue; }
+      if (c === '"') { inStr = true; s1 += c; continue; }
       if (c === ',') {
         let j = i + 1;
         while (j < raw.length && /\s/.test(raw[j])) j++;
         if (raw[j] === '}' || raw[j] === ']') continue;
       }
-      out += c;
+      s1 += c;
     }
 
-    const parsed = JSON.parse(out);
+    // pass 2 — mask string contents so we can reason about structure
+    let masked = '', inStr2 = false, esc2 = false;
+    for (let i = 0; i < s1.length; i++) {
+      const c = s1[i];
+      if (inStr2) {
+        if (esc2) { esc2 = false; masked += '\x00'; }
+        else if (c === '\\') { esc2 = true; masked += '\x00'; }
+        else if (c === '"') { inStr2 = false; masked += '"'; }
+        else { masked += '\x00'; }
+      } else {
+        if (c === '"') { inStr2 = true; masked += '"'; }
+        else { masked += c; }
+      }
+    }
+
+    // pass 3 — locate missing commas: value-end token followed (whitespace only)
+    // by an opener token ('"', '{', '[') means a ',' was dropped between them.
+    const inserts = [];
+    for (let i = 1; i < masked.length; i++) {
+      const cur = masked[i];
+      if (cur !== '"' && cur !== '{' && cur !== '[') continue;
+      let j = i - 1;
+      while (j >= 0 && /\s/.test(masked[j])) j--;
+      if (j < 0) continue;
+      const prev = masked[j];
+      const prevIsValue =
+        prev === '"' || prev === '}' || prev === ']' ||
+        /[0-9]/.test(prev) || /[a-zA-Z]/.test(prev);
+      if (prevIsValue) inserts.push(i);
+    }
+
+    // pass 4 — splice commas in
+    let fixed = '', prevIdx = 0;
+    for (const pos of inserts) {
+      if (pos <= prevIdx) continue;
+      fixed += s1.slice(prevIdx, pos) + ',';
+      prevIdx = pos;
+    }
+    fixed += s1.slice(prevIdx);
+
+    // best-effort revalidate; caller catches and reports
+    JSON.parse(fixed);
+    if (inserts.length) {
+      console.log('[shim] data.json repaired: ' + inserts.length + ' missing comma(s) inserted');
+    }
+    return fixed;
+  }
+
+  async function _load() {
+    if (_cache) return _cache;
+    const r = await fetch('/data.json', { cache: 'force-cache' });
+    if (!r.ok) throw new Error('data.json HTTP ' + r.status);
+    const raw = await r.text();
+    const parsed = JSON.parse(repairJSON(raw));
     _cache = Array.isArray(parsed) ? parsed : (parsed.records || []);
     return _cache;
   }
@@ -364,7 +414,6 @@ const io = new IntersectionObserver(entries => {
 }, { root: $out, rootMargin: '400px' });
 io.observe(sentinel);
 
-/* ---------- status ---------- */
 function setStatus(text, cls) {
   $status.className = 'status ' + (cls || '');
   $status.innerHTML = '<span class="pill"></span><span>' + escapeHtml(String(text == null ? '' : text)) + '</span>';
@@ -378,7 +427,6 @@ function idleStatus() {
   }
 }
 
-/* ---------- total DB ---------- */
 async function loadTotal() {
   try {
     const res = await fetch('/api/lookup?info=1', { headers: { 'accept': 'application/json' } });
@@ -391,7 +439,6 @@ async function loadTotal() {
   } catch (_) {}
 }
 
-/* ---------- helpers ---------- */
 function escapeHtml(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
     '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
@@ -416,7 +463,6 @@ function renderCard(r, prefix) {
   `;
 }
 
-/* ---------- page loader ---------- */
 async function loadPage(isFirst) {
   if (loading) return;
   if (!isFirst && currentOffset >= currentTotalMatches) return;
@@ -522,7 +568,6 @@ async function loadPage(isFirst) {
   }
 }
 
-/* ---------- search entry ---------- */
 function startSearch(prefix) {
   prefix = String(prefix || '').trim();
   currentQuery = prefix;
@@ -537,7 +582,6 @@ function startSearch(prefix) {
   loadPage(true);
 }
 
-/* ---------- wire ---------- */
 $form.addEventListener('submit', e => { e.preventDefault(); startSearch($q.value); });
 
 $q.addEventListener('input', () => {
@@ -546,7 +590,6 @@ $q.addEventListener('input', () => {
   debounceTimer = setTimeout(() => startSearch($q.value), 200);
 });
 
-/* ---------- boot ---------- */
 idleStatus();
 loadTotal();
 </script>
