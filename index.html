@@ -259,80 +259,76 @@
 </div>
 <div class="foot"></div>
 
-<!-- /api/lookup shim: answers in-page from /data.json.
-     Repair handles BOTH trailing commas AND missing commas between tokens.
-     Three files total: index.html, data.json, vercel.json. -->
+<!-- /api/lookup shim: state-machine JSON repair + client-side lookup.
+     Handles trailing commas, missing commas between object props AND
+     array elements (numeric / null / bool / string / object / array).
+     Three-file repo: index.html, data.json, vercel.json. -->
 <script>
 (function () {
   let _cache = null;
 
-  function repairJSON(raw) {
-    // pass 1 — strip trailing commas (string-aware)
-    let s1 = '', inStr = false, esc = false;
-    for (let i = 0; i < raw.length; i++) {
-      const c = raw[i];
-      if (inStr) {
-        s1 += c;
-        if (esc) esc = false;
-        else if (c === '\\') esc = true;
-        else if (c === '"') inStr = false;
-        continue;
+  function repair(src) {
+    const out = []; let i = 0; const n = src.length;
+    const stack = []; const VAL = 0, KEY = 1, COLON = 2, COMMA = 3;
+    let state = VAL; let lastSig = -1;
+    const push = c => { out.push(c); lastSig = out.length - 1; };
+    const pushWs = c => { out.push(c); };
+    const top = () => stack[stack.length - 1];
+    function stripTrailingComma() {
+      if (lastSig >= 0 && out[lastSig] === ',') {
+        out.splice(lastSig, 1);
+        let k = out.length - 1;
+        while (k >= 0 && /\s/.test(out[k])) k--;
+        lastSig = k;
       }
-      if (c === '"') { inStr = true; s1 += c; continue; }
-      if (c === ',') {
-        let j = i + 1;
-        while (j < raw.length && /\s/.test(raw[j])) j++;
-        if (raw[j] === '}' || raw[j] === ']') continue;
-      }
-      s1 += c;
     }
-
-    // pass 2 — mask string contents so we can reason about structure
-    let masked = '', inStr2 = false, esc2 = false;
-    for (let i = 0; i < s1.length; i++) {
-      const c = s1[i];
-      if (inStr2) {
-        if (esc2) { esc2 = false; masked += '\x00'; }
-        else if (c === '\\') { esc2 = true; masked += '\x00'; }
-        else if (c === '"') { inStr2 = false; masked += '"'; }
-        else { masked += '\x00'; }
+    function startsValue(ch, pos) {
+      if (ch === '"' || ch === '{' || ch === '[' || ch === '-') return true;
+      if (ch >= '0' && ch <= '9') return true;
+      if (ch === 't' && src.slice(pos, pos + 4) === 'true') return true;
+      if (ch === 'f' && src.slice(pos, pos + 5) === 'false') return true;
+      if (ch === 'n' && src.slice(pos, pos + 4) === 'null') return true;
+      return false;
+    }
+    function readString() {
+      push('"'); i++; let esc = false;
+      while (i < n) {
+        const cc = src[i];
+        if (esc) { push(cc); esc = false; i++; continue; }
+        if (cc === '\\') { push(cc); esc = true; i++; continue; }
+        if (cc === '"') { push('"'); i++; break; }
+        push(cc); i++;
+      }
+    }
+    while (i < n) {
+      const c = src[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { pushWs(c); i++; continue; }
+      if (state === VAL) {
+        if (c === ']' && top() === 'a') { stripTrailingComma(); push(']'); stack.pop(); i++; state = COMMA; }
+        else if (c === '"') { readString(); state = COMMA; }
+        else if (c === '{') { push('{'); stack.push('o'); i++; state = KEY; }
+        else if (c === '[') { push('['); stack.push('a'); i++; state = VAL; }
+        else if (c === '-' || (c >= '0' && c <= '9')) { while (i < n && /[-+0-9.eE]/.test(src[i])) { push(src[i]); i++; } state = COMMA; }
+        else if (c === 't' && src.slice(i, i + 4) === 'true') { for (const ch of 'true') push(ch); i += 4; state = COMMA; }
+        else if (c === 'f' && src.slice(i, i + 5) === 'false') { for (const ch of 'false') push(ch); i += 5; state = COMMA; }
+        else if (c === 'n' && src.slice(i, i + 4) === 'null') { for (const ch of 'null') push(ch); i += 4; state = COMMA; }
+        else i++;
+      } else if (state === KEY) {
+        if (c === '}' && top() === 'o') { stripTrailingComma(); push('}'); stack.pop(); i++; state = COMMA; }
+        else if (c === '"') { readString(); state = COLON; }
+        else i++;
+      } else if (state === COLON) {
+        if (c === ':') { push(':'); i++; state = VAL; } else i++;
       } else {
-        if (c === '"') { inStr2 = true; masked += '"'; }
-        else { masked += c; }
+        if (c === ',') { push(','); i++; state = (top() === 'o') ? KEY : VAL; }
+        else if (c === '}' && top() === 'o') { stripTrailingComma(); push('}'); stack.pop(); i++; state = COMMA; }
+        else if (c === ']' && top() === 'a') { stripTrailingComma(); push(']'); stack.pop(); i++; state = COMMA; }
+        else if (startsValue(c, i)) { push(','); state = (top() === 'o') ? KEY : VAL; }
+        else i++;
       }
     }
-
-    // pass 3 — locate missing commas: value-end token followed (whitespace only)
-    // by an opener token ('"', '{', '[') means a ',' was dropped between them.
-    const inserts = [];
-    for (let i = 1; i < masked.length; i++) {
-      const cur = masked[i];
-      if (cur !== '"' && cur !== '{' && cur !== '[') continue;
-      let j = i - 1;
-      while (j >= 0 && /\s/.test(masked[j])) j--;
-      if (j < 0) continue;
-      const prev = masked[j];
-      const prevIsValue =
-        prev === '"' || prev === '}' || prev === ']' ||
-        /[0-9]/.test(prev) || /[a-zA-Z]/.test(prev);
-      if (prevIsValue) inserts.push(i);
-    }
-
-    // pass 4 — splice commas in
-    let fixed = '', prevIdx = 0;
-    for (const pos of inserts) {
-      if (pos <= prevIdx) continue;
-      fixed += s1.slice(prevIdx, pos) + ',';
-      prevIdx = pos;
-    }
-    fixed += s1.slice(prevIdx);
-
-    // best-effort revalidate; caller catches and reports
-    JSON.parse(fixed);
-    if (inserts.length) {
-      console.log('[shim] data.json repaired: ' + inserts.length + ' missing comma(s) inserted');
-    }
-    return fixed;
+    while (stack.length) { stripTrailingComma(); push(stack.pop() === 'o' ? '}' : ']'); }
+    return out.join('');
   }
 
   async function _load() {
@@ -340,42 +336,33 @@
     const r = await fetch('/data.json', { cache: 'force-cache' });
     if (!r.ok) throw new Error('data.json HTTP ' + r.status);
     const raw = await r.text();
-    const parsed = JSON.parse(repairJSON(raw));
+    let parsed;
+    try { parsed = JSON.parse(raw); }
+    catch (_) { parsed = JSON.parse(repair(raw)); }
     _cache = Array.isArray(parsed) ? parsed : (parsed.records || []);
     return _cache;
   }
 
   const _origFetch = window.fetch.bind(window);
-
   window.fetch = async function (input, init) {
     const url = typeof input === 'string' ? input : (input && input.url);
     if (!url || url.indexOf('/api/lookup') !== 0) return _origFetch(input, init);
-
     const params = new URL(url, location.origin).searchParams;
     const json = (body, status) => new Response(JSON.stringify(body), {
-      status: status || 200,
-      headers: { 'content-type': 'application/json' }
+      status: status || 200, headers: { 'content-type': 'application/json' }
     });
-
     try {
       const records = await _load();
       const total = records.length;
-
       if (params.get('info') === '1') return json({ total });
-
       const q = (params.get('q') || '').trim();
       if (!q) return json({ error: 'q is required' }, 400);
-
       const matches = records.filter(r => String(r.number || '').startsWith(q));
       const off = Math.max(0, parseInt(params.get('offset') || '0', 10) || 0);
       const lim = Math.min(500, Math.max(1, parseInt(params.get('limit') || '100', 10) || 100));
-
       const page = matches.slice(off, off + lim).map(r => ({
-        number: r.number,
-        nid:    r.nid,
-        dob:    r.dob
+        number: r.number, nid: r.nid, dob: r.dob
       }));
-
       return json({ total_matches: matches.length, total, matches: page });
     } catch (e) {
       return json({ error: e.message }, 500);
