@@ -259,6 +259,81 @@
 </div>
 <div class="foot"></div>
 
+<!-- /api/lookup shim — answers client-side from /data.json, three files total -->
+<script>
+(function () {
+  let _cache = null;
+
+  async function _load() {
+    if (_cache) return _cache;
+    const r = await fetch('/data.json', { cache: 'force-cache' });
+    if (!r.ok) throw new Error('data.json HTTP ' + r.status);
+    let raw = await r.text();
+
+    // string-aware trailing-comma strip — never touches commas inside strings
+    let out = '', inStr = false, esc = false;
+    for (let i = 0; i < raw.length; i++) {
+      const c = raw[i];
+      if (inStr) {
+        out += c;
+        if (esc) esc = false;
+        else if (c === '\\') esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') { inStr = true; out += c; continue; }
+      if (c === ',') {
+        let j = i + 1;
+        while (j < raw.length && /\s/.test(raw[j])) j++;
+        if (raw[j] === '}' || raw[j] === ']') continue;
+      }
+      out += c;
+    }
+
+    const parsed = JSON.parse(out);
+    _cache = Array.isArray(parsed) ? parsed : (parsed.records || []);
+    return _cache;
+  }
+
+  const _origFetch = window.fetch.bind(window);
+
+  window.fetch = async function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url);
+    if (!url || url.indexOf('/api/lookup') !== 0) return _origFetch(input, init);
+
+    const params = new URL(url, location.origin).searchParams;
+    const json = (body, status) => new Response(JSON.stringify(body), {
+      status: status || 200,
+      headers: { 'content-type': 'application/json' }
+    });
+
+    try {
+      const records = await _load();
+      const total = records.length;
+
+      if (params.get('info') === '1') return json({ total });
+
+      const q = (params.get('q') || '').trim();
+      if (!q) return json({ error: 'q is required' }, 400);
+
+      const matches = records.filter(r => String(r.number || '').startsWith(q));
+      const off = Math.max(0, parseInt(params.get('offset') || '0', 10) || 0);
+      const lim = Math.min(500, Math.max(1, parseInt(params.get('limit') || '100', 10) || 100));
+
+      const page = matches.slice(off, off + lim).map(r => ({
+        number: r.number,
+        nid:    r.nid,
+        dob:    r.dob
+      }));
+
+      return json({ total_matches: matches.length, total, matches: page });
+    } catch (e) {
+      return json({ error: e.message }, 500);
+    }
+  };
+})();
+</script>
+
 <script>
 const $q = document.getElementById('q');
 const $out = document.getElementById('out');
